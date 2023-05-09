@@ -1,13 +1,11 @@
 #![feature(min_specialization)]
 #![cfg(test)]
 
-use dunce::canonicalize;
-use regex::{Captures, Regex, Replacer};
 use std::{
     env,
     fmt::Write,
-    future::Future,
-    net::SocketAddr,
+    future::{pending, Future},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     time::Duration,
@@ -25,10 +23,16 @@ use chromiumoxide::{
     },
     error::CdpError::Ws,
 };
+use dunce::canonicalize;
 use futures::StreamExt;
 use lazy_static::lazy_static;
+use next_core::turbopack::{
+    cli_utils::issue::{format_issue, LogOptions},
+    core::issue::IssueSeverity,
+};
 use next_dev::{EntryRequest, NextDevServerBuilder};
 use owo_colors::OwoColorize;
+use regex::{Captures, Regex, Replacer};
 use serde::Deserialize;
 use tokio::{
     net::TcpSocket,
@@ -36,19 +40,25 @@ use tokio::{
     task::JoinSet,
 };
 use tungstenite::{error::ProtocolError::ResetWithoutClosingHandshake, Error::Protocol};
-use turbo_tasks::{
-    debug::{ValueDebug, ValueDebugStringReadRef},
-    primitives::{BoolVc, StringVc},
-    NothingVc, RawVc, ReadRef, State, TransientInstance, TransientValue, TurboTasks,
+use turbo_binding::{
+    turbo::{
+        tasks::{
+            debug::{ValueDebug, ValueDebugStringReadRef},
+            primitives::{BoolVc, StringVc},
+            NothingVc, RawVc, ReadRef, State, TransientInstance, TransientValue, TurboTasks,
+        },
+        tasks_fs::{DiskFileSystemVc, FileSystem, FileSystemPathVc},
+        tasks_memory::MemoryBackend,
+        tasks_testing::retry::retry_async,
+    },
+    turbopack::{
+        core::issue::{
+            CapturedIssues, Issue, IssueReporter, IssueReporterVc, IssueSeverityVc, IssueVc,
+            IssuesVc, OptionIssueSourceVc, PlainIssueReadRef,
+        },
+        test_utils::snapshot::snapshot_issues,
+    },
 };
-use turbo_tasks_fs::{DiskFileSystemVc, FileSystem, FileSystemPathVc};
-use turbo_tasks_memory::MemoryBackend;
-use turbo_tasks_testing::retry::retry_async;
-use turbopack_core::issue::{
-    CapturedIssues, Issue, IssueReporter, IssueReporterVc, IssueSeverityVc, IssueVc, IssuesVc,
-    OptionIssueSourceVc, PlainIssueReadRef,
-};
-use turbopack_test_utils::snapshot::snapshot_issues;
 
 fn register() {
     next_dev::register();
@@ -69,9 +79,11 @@ struct JestTestResult {
 }
 
 lazy_static! {
-    // Allows for interactive manual debugging of a test case in a browser with:
-    // `TURBOPACK_DEBUG_BROWSER=1 cargo test -p next-dev-tests -- test_my_pattern --nocapture`
+    /// Allows for interactive manual debugging of a test case in a browser with:
+    /// `TURBOPACK_DEBUG_BROWSER=1 cargo test -p next-dev-tests -- test_my_pattern --nocapture`
     static ref DEBUG_BROWSER: bool = env::var("TURBOPACK_DEBUG_BROWSER").is_ok();
+    /// Only starts the dev server on port 3000, but doesn't spawn a browser or run any tests.
+    static ref DEBUG_START: bool = env::var("TURBOPACK_DEBUG_START").is_ok();
 }
 
 fn run_async_test<'a, T>(future: impl Future<Output = T> + Send + 'a) -> T {
@@ -96,8 +108,9 @@ fn run_async_test<'a, T>(future: impl Future<Output = T> + Send + 'a) -> T {
     }
 }
 
-#[testing::fixture("tests/integration/*/*/*")]
+#[testing::fixture("tests/integration/*/*/*/input")]
 fn test(resource: PathBuf) {
+    let resource = resource.parent().unwrap().to_path_buf();
     if resource.ends_with("__skipped__") || resource.ends_with("__flakey__") {
         // "Skip" directories named `__skipped__`, which include test directories to
         // skip. These tests are not considered truly skipped by `cargo test`, but they
@@ -140,9 +153,10 @@ fn test(resource: PathBuf) {
     };
 }
 
-#[testing::fixture("tests/integration/*/*/__skipped__/*")]
+#[testing::fixture("tests/integration/*/*/__skipped__/*/input")]
 #[should_panic]
 fn test_skipped_fails(resource: PathBuf) {
+    let resource = resource.parent().unwrap().to_path_buf();
     let run_result = run_async_test(run_test(resource));
 
     // Assert that this skipped test itself has at least one browser test which
@@ -197,13 +211,13 @@ async fn run_test(resource: PathBuf) -> JestRunResult {
     )
     .entry_request(EntryRequest::Module(
         "@turbo/pack-test-harness".to_string(),
-        "".to_string(),
+        "/harness".to_string(),
     ))
     .entry_request(EntryRequest::Relative("index.js".to_owned()))
     .eager_compile(false)
     .hostname(requested_addr.ip())
     .port(requested_addr.port())
-    .log_level(turbopack_core::issue::IssueSeverity::Warning)
+    .log_level(turbo_binding::turbopack::core::issue::IssueSeverity::Warning)
     .log_detail(true)
     .issue_reporter(Box::new(move || {
         TestIssueReporterVc::new(issue_tx.clone()).into()
@@ -213,16 +227,28 @@ async fn run_test(resource: PathBuf) -> JestRunResult {
     .await
     .unwrap();
 
+    let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), server.addr.port());
+
     println!(
         "{event_type} - server started at http://{address}",
         event_type = "ready".green(),
         address = server.addr
     );
 
+    if *DEBUG_START {
+        webbrowser::open(&local_addr.to_string()).unwrap();
+        tokio::select! {
+            _ = mock_server_future => {},
+            _ = pending() => {},
+            _ = server.future => {},
+        };
+        panic!("Never resolves")
+    }
+
     let result = tokio::select! {
         // Poll the mock_server first to add the env var
         _ = mock_server_future => panic!("Never resolves"),
-        r = run_browser(server.addr) => r.expect("error while running browser"),
+        r = run_browser(local_addr) => r.expect("error while running browser"),
         _ = server.future => panic!("Never resolves"),
     };
 
@@ -383,12 +409,17 @@ async fn run_browser(addr: SocketAddr) -> Result<JestRunResult> {
                             writeln!(message, "    at {} ({}:{}:{})", frame.function_name, frame.url, frame.line_number, frame.column_number)?;
                         }
                     }
+                    let expected_error = message.contains("(expected error)");
                     let message = message.trim_end();
                     if !is_debugging {
-                        return Err(anyhow!(
-                            "Exception throw in page: {}",
-                            message
-                        ))
+                        if !expected_error {
+                            return Err(anyhow!(
+                                "Exception throw in page: {}",
+                                message
+                            ))
+                        }
+                    } else if expected_error {
+                        println!("Exception throw in page:\n{}", message);
                     } else {
                         println!("Exception throw in page (this would fail the test case without TURBOPACK_DEBUG_BROWSER):\n{}", message);
                     }
@@ -442,8 +473,8 @@ async fn run_browser(addr: SocketAddr) -> Result<JestRunResult> {
 }
 
 fn get_free_local_addr() -> Result<SocketAddr, std::io::Error> {
-    let socket = TcpSocket::new_v4()?;
-    socket.bind("127.0.0.1:0".parse().unwrap())?;
+    let socket = TcpSocket::new_v6()?;
+    socket.bind("[::]:0".parse().unwrap())?;
     socket.local_addr()
 }
 
@@ -495,10 +526,18 @@ impl IssueReporter for TestIssueReporter {
         captured_issues: TransientInstance<ReadRef<CapturedIssues>>,
         _source: TransientValue<RawVc>,
     ) -> Result<BoolVc> {
+        let log_options = LogOptions {
+            current_dir: PathBuf::new(),
+            project_dir: PathBuf::new(),
+            show_all: true,
+            log_detail: true,
+            log_level: IssueSeverity::Info,
+        };
         let issue_tx = self.issue_tx.get_untracked().clone();
         for (issue, path) in captured_issues.iter_with_shortest_path() {
             let plain = NormalizedIssue(issue).cell().as_issue().into_plain(path);
             issue_tx.send((plain.await?, plain.dbg().await?))?;
+            println!("{}", format_issue(&*plain.await?, None, &log_options));
         }
         Ok(BoolVc::cell(false))
     }
@@ -546,9 +585,19 @@ impl Issue for NormalizedIssue {
     #[turbo_tasks::function]
     async fn description(&self) -> Result<StringVc> {
         let str = self.0.description().await?;
-        let regex = Regex::new(r"\n  at (.+) \((.+)\)").unwrap();
+        let regex1 = Regex::new(r"\n  +at (.+) \((.+)\)(?: \[.+\])?").unwrap();
+        let regex2 = Regex::new(r"\n  +at ()(.+) \[.+\]").unwrap();
+        let regex3 = Regex::new(r"\n  +\[at .+\]").unwrap();
         Ok(StringVc::cell(
-            regex.replace_all(&str, StackTraceReplacer).to_string(),
+            regex3
+                .replace_all(
+                    &regex2.replace_all(
+                        &regex1.replace_all(&str, StackTraceReplacer),
+                        StackTraceReplacer,
+                    ),
+                    "",
+                )
+                .to_string(),
         ))
     }
 

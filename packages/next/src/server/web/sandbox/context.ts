@@ -13,7 +13,10 @@ import { readFileSync, promises as fs } from 'fs'
 import { validateURL } from '../utils'
 import { pick } from '../../../lib/pick'
 import { fetchInlineAsset } from './fetch-inline-assets'
-import type { EdgeFunctionDefinition } from '../../../build/webpack/plugins/middleware-plugin'
+import type {
+  EdgeFunctionDefinition,
+  SUPPORTED_NATIVE_MODULES,
+} from '../../../build/webpack/plugins/middleware-plugin'
 import { UnwrapPromise } from '../../../lib/coalesced-function'
 import { runInContext } from 'vm'
 import BufferImplementation from 'node:buffer'
@@ -38,20 +41,36 @@ interface ModuleContext {
  */
 const moduleContexts = new Map<string, ModuleContext>()
 
+const pendingModuleCaches = new Map<string, Promise<ModuleContext>>()
+
 /**
  * For a given path a context, this function checks if there is any module
  * context that contains the path with an older content and, if that's the
  * case, removes the context from the cache.
  */
-export function clearModuleContext(path: string, content: Buffer | string) {
-  for (const [key, cache] of moduleContexts) {
+export async function clearModuleContext(
+  path: string,
+  content: Buffer | string
+) {
+  const handleContext = (
+    key: string,
+    cache: ReturnType<typeof moduleContexts['get']>,
+    context: typeof moduleContexts | typeof pendingModuleCaches
+  ) => {
     const prev = cache?.paths.get(path)?.replace(WEBPACK_HASH_REGEX, '')
     if (
       typeof prev !== 'undefined' &&
       prev !== content.toString().replace(WEBPACK_HASH_REGEX, '')
     ) {
-      moduleContexts.delete(key)
+      context.delete(key)
     }
+  }
+
+  for (const [key, cache] of moduleContexts) {
+    handleContext(key, cache, moduleContexts)
+  }
+  for (const [key, cache] of pendingModuleCaches) {
+    handleContext(key, await cache, pendingModuleCaches)
   }
 }
 
@@ -98,7 +117,7 @@ function createProcessPolyfill(options: Pick<ModuleContextOptions, 'env'>) {
     if (key === 'env') continue
     Object.defineProperty(processPolyfill, key, {
       get() {
-        if (overridenValue[key]) {
+        if (overridenValue[key] !== undefined) {
           return overridenValue[key]
         }
         if (typeof (process as any)[key] === 'function') {
@@ -144,20 +163,19 @@ function getDecorateUnhandledRejection(runtime: EdgeRuntime) {
   }
 }
 
-const NativeModuleMap = new Map<string, unknown>([
-  [
-    'node:buffer',
-    pick(BufferImplementation, [
+const NativeModuleMap = (() => {
+  const mods: Record<
+    `node:${typeof SUPPORTED_NATIVE_MODULES[number]}`,
+    unknown
+  > = {
+    'node:buffer': pick(BufferImplementation, [
       'constants',
       'kMaxLength',
       'kStringMaxLength',
       'Buffer',
       'SlowBuffer',
     ]),
-  ],
-  [
-    'node:events',
-    pick(EventsImplementation, [
+    'node:events': pick(EventsImplementation, [
       'EventEmitter',
       'captureRejectionSymbol',
       'defaultMaxListeners',
@@ -166,22 +184,42 @@ const NativeModuleMap = new Map<string, unknown>([
       'on',
       'once',
     ]),
-  ],
-  [
-    'node:async_hooks',
-    pick(AsyncHooksImplementation, ['AsyncLocalStorage', 'AsyncResource']),
-  ],
-  [
-    'node:assert',
-    // TODO: check if need to pick specific properties
-    AssertImplementation,
-  ],
-  [
-    'node:util',
-    // TODO: check if need to pick specific properties
-    UtilImplementation,
-  ],
-])
+    'node:async_hooks': pick(AsyncHooksImplementation, [
+      'AsyncLocalStorage',
+      'AsyncResource',
+    ]),
+    'node:assert': pick(AssertImplementation, [
+      'AssertionError',
+      'deepEqual',
+      'deepStrictEqual',
+      'doesNotMatch',
+      'doesNotReject',
+      'doesNotThrow',
+      'equal',
+      'fail',
+      'ifError',
+      'match',
+      'notDeepEqual',
+      'notDeepStrictEqual',
+      'notEqual',
+      'notStrictEqual',
+      'ok',
+      'rejects',
+      'strict',
+      'strictEqual',
+      'throws',
+    ]),
+    'node:util': pick(UtilImplementation, [
+      '_extend' as any,
+      'callbackify',
+      'format',
+      'inherits',
+      'promisify',
+      'types',
+    ]),
+  }
+  return new Map(Object.entries(mods))
+})()
 
 /**
  * Create a module cache specific for the provided parameters. It includes
@@ -197,6 +235,7 @@ async function createModuleContext(options: ModuleContextOptions) {
         ? { strings: true, wasm: true }
         : undefined,
     extend: (context) => {
+      context.WebSocket = require('next/dist/compiled/ws').WebSocket
       context.process = createProcessPolyfill(options)
 
       Object.defineProperty(context, 'require', {
@@ -381,8 +420,6 @@ interface ModuleContextOptions {
   distDir: string
   edgeFunctionEntry: Pick<EdgeFunctionDefinition, 'assets' | 'wasm'>
 }
-
-const pendingModuleCaches = new Map<string, Promise<ModuleContext>>()
 
 function getModuleContextShared(options: ModuleContextOptions) {
   let deferredModuleContext = pendingModuleCaches.get(options.moduleName)

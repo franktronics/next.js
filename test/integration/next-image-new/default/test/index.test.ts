@@ -126,20 +126,31 @@ function runTests(mode) {
         const imagesizes = await link.getAttribute('imagesizes')
         entries.push({ fetchpriority, imagesrcset, imagesizes })
       }
-      expect(entries).toEqual([
-        {
-          fetchpriority: 'high',
-          imagesizes: '',
-          imagesrcset:
-            '/_next/image?url=%2Ftest.jpg&w=640&q=75 1x, /_next/image?url=%2Ftest.jpg&w=828&q=75 2x',
-        },
-        {
-          fetchpriority: 'high',
-          imagesizes: '100vw',
-          imagesrcset:
-            '/_next/image?url=%2Fwide.png&w=640&q=75 640w, /_next/image?url=%2Fwide.png&w=750&q=75 750w, /_next/image?url=%2Fwide.png&w=828&q=75 828w, /_next/image?url=%2Fwide.png&w=1080&q=75 1080w, /_next/image?url=%2Fwide.png&w=1200&q=75 1200w, /_next/image?url=%2Fwide.png&w=1920&q=75 1920w, /_next/image?url=%2Fwide.png&w=2048&q=75 2048w, /_next/image?url=%2Fwide.png&w=3840&q=75 3840w',
-        },
-      ])
+      expect(
+        entries.find(
+          (item) =>
+            item.imagesrcset ===
+            '/_next/image?url=%2Ftest.jpg&w=640&q=75 1x, /_next/image?url=%2Ftest.jpg&w=828&q=75 2x'
+        )
+      ).toEqual({
+        fetchpriority: 'high',
+        imagesizes: '',
+        imagesrcset:
+          '/_next/image?url=%2Ftest.jpg&w=640&q=75 1x, /_next/image?url=%2Ftest.jpg&w=828&q=75 2x',
+      })
+
+      expect(
+        entries.find(
+          (item) =>
+            item.imagesrcset ===
+            '/_next/image?url=%2Fwide.png&w=640&q=75 640w, /_next/image?url=%2Fwide.png&w=750&q=75 750w, /_next/image?url=%2Fwide.png&w=828&q=75 828w, /_next/image?url=%2Fwide.png&w=1080&q=75 1080w, /_next/image?url=%2Fwide.png&w=1200&q=75 1200w, /_next/image?url=%2Fwide.png&w=1920&q=75 1920w, /_next/image?url=%2Fwide.png&w=2048&q=75 2048w, /_next/image?url=%2Fwide.png&w=3840&q=75 3840w'
+        )
+      ).toEqual({
+        fetchpriority: 'high',
+        imagesizes: '100vw',
+        imagesrcset:
+          '/_next/image?url=%2Fwide.png&w=640&q=75 640w, /_next/image?url=%2Fwide.png&w=750&q=75 750w, /_next/image?url=%2Fwide.png&w=828&q=75 828w, /_next/image?url=%2Fwide.png&w=1080&q=75 1080w, /_next/image?url=%2Fwide.png&w=1200&q=75 1200w, /_next/image?url=%2Fwide.png&w=1920&q=75 1920w, /_next/image?url=%2Fwide.png&w=2048&q=75 2048w, /_next/image?url=%2Fwide.png&w=3840&q=75 3840w',
+      })
 
       // When priority={true}, we should _not_ set loading="lazy"
       expect(
@@ -183,13 +194,16 @@ function runTests(mode) {
       expect(warnings).not.toMatch(
         /was detected as the Largest Contentful Paint/gm
       )
+      expect(warnings).not.toMatch(/React does not recognize the (.+) prop/gm)
 
       // should preload with crossorigin
       expect(
-        await browser.elementsByCss(
-          'link[rel=preload][as=image][crossorigin=anonymous][imagesrcset*="test.jpg"]'
-        )
-      ).toHaveLength(1)
+        (
+          await browser.elementsByCss(
+            'link[rel=preload][as=image][crossorigin=anonymous][imagesrcset*="test.jpg"]'
+          )
+        ).length
+      ).toBeGreaterThanOrEqual(1)
     } finally {
       if (browser) {
         await browser.close()
@@ -764,6 +778,16 @@ function runTests(mode) {
       }, /Image is missing required "src" property/gm)
     })
 
+    it('should show empty string src error', async () => {
+      const browser = await webdriver(appPort, '/empty-string-src')
+
+      expect(await hasRedbox(browser, false)).toBe(false)
+
+      await check(async () => {
+        return (await browser.log()).map((log) => log.message).join('\n')
+      }, /Image is missing required "src" property/gm)
+    })
+
     it('should show invalid src error', async () => {
       const browser = await webdriver(appPort, '/invalid-src')
 
@@ -797,6 +821,15 @@ function runTests(mode) {
       expect(await hasRedbox(browser, true)).toBe(true)
       expect(await getRedboxHeader(browser)).toContain(
         `Image with src "/test.jpg" has invalid "width" property. Expected a numeric value in pixels but received "100%".`
+      )
+    })
+
+    it('should show error when invalid Infinity width prop', async () => {
+      const browser = await webdriver(appPort, '/invalid-Infinity-width')
+
+      expect(await hasRedbox(browser, true)).toBe(true)
+      expect(await getRedboxHeader(browser)).toContain(
+        `Image with src "/test.jpg" has invalid "width" property. Expected a numeric value in pixels but received "Infinity".`
       )
     })
 
@@ -1013,6 +1046,36 @@ function runTests(mode) {
       expect(
         existsSync(join(appDir, '.next/server/chunks/static/media'))
       ).toBeFalsy()
+    })
+    it('should render as unoptimized with missing src prop', async () => {
+      const browser = await webdriver(appPort, '/missing-src')
+
+      const warnings = (await browser.log()).filter(
+        (log) => log.source === 'error'
+      )
+      expect(warnings.length).toBe(0)
+
+      expect(await browser.elementById('img').getAttribute('src')).toBe('')
+      expect(await browser.elementById('img').getAttribute('srcset')).toBe(null)
+      expect(await browser.elementById('img').getAttribute('width')).toBe('200')
+      expect(await browser.elementById('img').getAttribute('height')).toBe(
+        '300'
+      )
+    })
+    it('should render as unoptimized with empty string src prop', async () => {
+      const browser = await webdriver(appPort, '/empty-string-src')
+
+      const warnings = (await browser.log()).filter(
+        (log) => log.source === 'error'
+      )
+      expect(warnings.length).toBe(0)
+
+      expect(await browser.elementById('img').getAttribute('src')).toBe('')
+      expect(await browser.elementById('img').getAttribute('srcset')).toBe(null)
+      expect(await browser.elementById('img').getAttribute('width')).toBe('200')
+      expect(await browser.elementById('img').getAttribute('height')).toBe(
+        '300'
+      )
     })
   }
 
